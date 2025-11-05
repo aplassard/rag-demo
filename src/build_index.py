@@ -1,9 +1,10 @@
 # src/build_index_sharded.py
 from __future__ import annotations
-import os, json, orjson, re
+import os, json, orjson, re, time
 from pathlib import Path
 from typing import Iterable, Dict
 import faiss, numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
@@ -42,13 +43,55 @@ def build_sharded(
     batch_encode=256,
     resume=True,
     device="mps",
+    compute_dtype="auto",
     quantize=None  # options: None | "SQ8" | "PQ64" (see notes below)
 ):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(out)
 
-    model = SentenceTransformer(emb_model)
+    normalized_device = {
+        "gpu": "cuda",
+        "cuda": "cuda",
+        "cpu": "cpu",
+        "mps": "mps",
+    }.get(str(device).lower(), str(device))
+
+    if normalized_device.startswith("cuda") and not torch.cuda.is_available():
+        print("⚠️ CUDA requested but not available. Falling back to CPU.")
+        normalized_device = "cpu"
+    if normalized_device == "mps" and not torch.backends.mps.is_available():
+        print("⚠️ MPS requested but not available. Falling back to CPU.")
+        normalized_device = "cpu"
+
+    dtype_map = {
+        "auto": None,
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    compute_dtype_key = str(compute_dtype).lower()
+    if compute_dtype_key not in dtype_map:
+        raise ValueError(f"Unsupported compute_dtype '{compute_dtype}'. Choose from {list(dtype_map.keys())}.")
+
+    chosen_dtype = dtype_map[compute_dtype_key]
+    if chosen_dtype is None:
+        if normalized_device in ("cuda", "mps") or normalized_device.startswith("cuda"):
+            chosen_dtype = torch.float16
+        else:
+            chosen_dtype = torch.float32
+
+    if normalized_device == "cpu" and chosen_dtype != torch.float32:
+        print("⚠️ Non-fp32 dtype requested on CPU; defaulting to float32.")
+        chosen_dtype = torch.float32
+    if normalized_device == "mps" and chosen_dtype == torch.bfloat16:
+        print("⚠️ bfloat16 not supported on MPS; defaulting to float16.")
+        chosen_dtype = torch.float16
+
+    model_kwargs = {"dtype": chosen_dtype}
+    model = SentenceTransformer(emb_model, device=normalized_device, model_kwargs=model_kwargs)
+    model = model.to(dtype=chosen_dtype)
+    model.eval()
     dim = model.get_sentence_embedding_dimension()
     if manifest["embedding_model"] is None:
         manifest["embedding_model"] = emb_model
@@ -61,20 +104,37 @@ def build_sharded(
     texts, ids, metas = [], [], []
     shard_count = 0
     next_id = int(manifest.get("next_global_id", 1))
+    total_chunks = 0
+    total_docs = 0
 
     def flush_shard(shard_name: str):
-        nonlocal texts, ids, metas, shard_count
+        nonlocal texts, ids, metas, shard_count, total_chunks
         if not texts: return
         # build index for this shard
         idx = new_index(dim)
+        shard_chunk_count = len(texts)
+        print(
+            f"[shard {shard_name}] building index for {shard_chunk_count} chunks "
+            f"(processed {total_chunks + shard_chunk_count} total)",
+            flush=True,
+        )
 
-        # encode in sub-batches to limit memory
-        start = 0
-        while start < len(texts):
-            sub = texts[start:start+batch_encode]
-            embs = model.encode(sub, normalize_embeddings=True, convert_to_numpy=True, batch_size=batch_encode, device=device)
-            idx.add_with_ids(embs.astype("float32"), np.array(ids[start:start+batch_encode], dtype="int64"))
-            start += batch_encode
+        effective_batch_size = max(1, min(batch_encode, shard_chunk_count))
+        encode_start = time.perf_counter()
+        embeddings = model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            batch_size=effective_batch_size,
+            device=normalized_device,
+            show_progress_bar=shard_chunk_count >= effective_batch_size * 8,
+        )
+        encode_duration = time.perf_counter() - encode_start
+        embeddings = np.ascontiguousarray(embeddings, dtype="float32")
+        id_array = np.ascontiguousarray(ids, dtype="int64")
+        add_start = time.perf_counter()
+        idx.add_with_ids(embeddings, id_array)
+        add_duration = time.perf_counter() - add_start
 
         # optional quantization per-shard
         if quantize == "SQ8":
@@ -93,7 +153,9 @@ def build_sharded(
 
         shard_dir = out / shard_name
         shard_dir.mkdir(parents=True, exist_ok=True)
+        write_start = time.perf_counter()
         faiss.write_index(idx, str(shard_dir / "faiss.index"))
+        write_duration = time.perf_counter() - write_start
 
         with open(shard_dir / "meta.jsonl", "wb") as mf:
             for m in metas: mf.write(orjson.dumps(m) + b"\n")
@@ -105,7 +167,14 @@ def build_sharded(
 
         # reset buffers
         shard_count += 1
+        total_chunks += shard_chunk_count
         texts, ids, metas = [], [], []
+        print(
+            f"[shard {shard_name}] encode {encode_duration:.2f}s "
+            f"({shard_chunk_count/encode_duration if encode_duration else 0:.0f} chunks/s), "
+            f"add {add_duration:.2f}s, write {write_duration:.2f}s",
+            flush=True,
+        )
 
     shard_name = f"shard_{next_shard_idx:04d}"
 
@@ -114,6 +183,7 @@ def build_sharded(
 
     for ex in tqdm(read_wiki(in_jsonl), desc="sharding+chunking"):
         doc_id, title, url = ex.get("id"), ex.get("title",""), ex.get("url","")
+        total_docs += 1
         for w in chunk(ex.get("text","")):
             fid = next_id; next_id += 1
             texts.append(w); ids.append(fid)
@@ -127,7 +197,11 @@ def build_sharded(
 
     # final flush
     flush_shard(shard_name)
-    print(f"✅ Finished. Shards: {len(manifest['shards'])}, next_global_id={manifest['next_global_id']}")
+    print(
+        f"✅ Finished. Shards: {len(manifest['shards'])}, "
+        f"chunks: {total_chunks}, docs read: {total_docs}, "
+        f"next_global_id={manifest['next_global_id']}",
+    )
 
 if __name__ == "__main__":
     import argparse
@@ -139,6 +213,7 @@ if __name__ == "__main__":
     ap.add_argument("--batch-encode", type=int, default=256)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--quantize", choices=["SQ8","PQ64"], default=None)
-    ap.add_argument("--device", choices=["cpu","mps", "gpu"], default="cpu")
+    ap.add_argument("--device", choices=["cpu","mps","cuda","gpu"], default="cpu")
+    ap.add_argument("--compute-dtype", choices=["auto","float32","float16","bfloat16"], default="auto")
     args = ap.parse_args()
     build_sharded(**vars(args))
