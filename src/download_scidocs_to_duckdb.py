@@ -50,76 +50,83 @@ def main(db_path: str):
         );
     """)
 
-    # Insert docs
-    docs_it = ds.docs_iter()
-    batch = []
-    BATCH_SIZE = 5000
-    for d in tqdm(docs_it, desc="docs"):
-        batch.append((
-            d.doc_id,
-            getattr(d, "title", "") or "",
-            getattr(d, "text", "") or "",
-            list(getattr(d, "authors", []) or []),
-            int(getattr(d, "year", 0) or 0),
-            list(getattr(d, "cited_by", []) or []),
-            list(getattr(d, "references", []) or []),
-        ))
-        if len(batch) >= BATCH_SIZE:
+    con.execute("BEGIN TRANSACTION;")
+    try:
+        # Insert docs
+        docs_it = ds.docs_iter()
+        batch = []
+        BATCH_SIZE = 5000
+        for d in tqdm(docs_it, desc="docs"):
+            batch.append((
+                d.doc_id,
+                getattr(d, "title", "") or "",
+                getattr(d, "text", "") or "",
+                list(getattr(d, "authors", []) or []),
+                int(getattr(d, "year", 0) or 0),
+                list(getattr(d, "cited_by", []) or []),
+                list(getattr(d, "references", []) or []),
+            ))
+            if len(batch) >= BATCH_SIZE:
+                con.executemany(
+                    "INSERT OR REPLACE INTO scidocs_docs (doc_id, title, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                    batch
+                )
+                batch.clear()
+        if batch:
             con.executemany(
                 "INSERT OR REPLACE INTO scidocs_docs (doc_id, title, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?, ?);",
                 batch
             )
             batch.clear()
-    if batch:
-        con.executemany(
-            "INSERT OR REPLACE INTO scidocs_docs (doc_id, title, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?, ?);",
-            batch
-        )
-        batch.clear()
 
-    # Insert queries
-    q_it = ds.queries_iter()
-    batch = []
-    for q in tqdm(q_it, desc="queries"):
-        batch.append((
-            q.query_id,
-            q.text,
-            list(getattr(q, "authors", []) or []),
-            int(getattr(q, "year", 0) or 0),
-            list(getattr(q, "cited_by", []) or []),
-            list(getattr(q, "references", []) or []),
-        ))
-        if len(batch) >= BATCH_SIZE:
+        # Insert queries
+        q_it = ds.queries_iter()
+        batch = []
+        for q in tqdm(q_it, desc="queries"):
+            batch.append((
+                q.query_id,
+                q.text,
+                list(getattr(q, "authors", []) or []),
+                int(getattr(q, "year", 0) or 0),
+                list(getattr(q, "cited_by", []) or []),
+                list(getattr(q, "references", []) or []),
+            ))
+            if len(batch) >= BATCH_SIZE:
+                con.executemany(
+                    "INSERT OR REPLACE INTO scidocs_queries (query_id, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?);",
+                    batch
+                )
+                batch.clear()
+        if batch:
             con.executemany(
                 "INSERT OR REPLACE INTO scidocs_queries (query_id, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?);",
                 batch
             )
             batch.clear()
-    if batch:
-        con.executemany(
-            "INSERT OR REPLACE INTO scidocs_queries (query_id, text, authors, year, cited_by, reference_ids) VALUES (?, ?, ?, ?, ?, ?);",
-            batch
-        )
-        batch.clear()
 
-    # Insert qrels
-    qrels_it = ds.qrels_iter()
-    batch = []
-    for qr in tqdm(qrels_it, desc="qrels"):
-        batch.append((qr.query_id, qr.doc_id, int(qr.relevance), getattr(qr, "iteration", "")))
-        if len(batch) >= BATCH_SIZE * 4:
+        # Insert qrels
+        qrels_it = ds.qrels_iter()
+        batch = []
+        for qr in tqdm(qrels_it, desc="qrels"):
+            batch.append((qr.query_id, qr.doc_id, int(qr.relevance), getattr(qr, "iteration", "")))
+            if len(batch) >= BATCH_SIZE * 4:
+                con.executemany(
+                    "INSERT INTO scidocs_qrels VALUES (?, ?, ?, ?);",
+                    batch
+                )
+                batch.clear()
+        if batch:
             con.executemany(
                 "INSERT INTO scidocs_qrels VALUES (?, ?, ?, ?);",
                 batch
             )
-            batch.clear()
-    if batch:
-        con.executemany(
-            "INSERT INTO scidocs_qrels VALUES (?, ?, ?, ?);",
-            batch
-        )
-
-    con.close()
+    except Exception:
+        con.execute("ROLLBACK;")
+        raise
+    else:
+        con.execute("COMMIT;")
+    finally:
+        con.close()
     print(f"✅ Loaded SciDocs into {db_path}")
 
 if __name__ == "__main__":
